@@ -2,9 +2,13 @@
 
 Both expose a Unix-socket JS eval driver over CDP. They solve different problems.
 
+**chrome-headcrab is single-session.** One real Google Chrome, one held driver.
+No multi-agent parallelization, no per-agent profile clones. If you need that,
+use chad-browser.
+
 ## Use chad-browser when
 
-- You want **isolation** (parallel agents, disposable profiles)
+- You want **isolation** / disposable profiles (including parallel agents)
 - You want logins seeded from `~/.config/chromium` without touching daily Chrome
 - You need `up`/`down` to fully own browser lifecycle
 - QA / adversarial / walking-sniper style workflows

@@ -4,6 +4,8 @@ Common recipes. Each assumes Chrome already has remote debugging enabled at
 `chrome://inspect/#remote-debugging` and that you have (or will) click **Allow**
 once on `attach`.
 
+Single-driver only — no parallel-agent recipes. One attach, drive that session.
+
 ## Attach once, drive forever, detach driver only
 
 ```bash

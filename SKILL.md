@@ -50,7 +50,7 @@ extensions, Google/enterprise logins that are painful to reseed, or debugging
 exactly what the user is looking at.
 
 **Do NOT use** when:
-- You need isolation / parallel agents / disposable profiles → **chad-browser**
+- You need isolation / disposable profiles → **chad-browser** (headcrab is one Chrome, one driver — no multi-agent fan-out)
 - A static fetch or API call is enough → curl / API tools
 - You were about to launch a throwaway browser for QA → chad-browser
 
@@ -127,5 +127,7 @@ ln -sfn ~/work/chrome-headcrab/bin/chrome-headcrab ~/.local/bin/chrome-headcrab
 
 Requires: `google-chrome`, `node` (v22+), `python3`.
 
-See `references/` for the Allow flow, driving helpers (chad-parity), workflows,
-command reference, and the chad-browser comparison.
+See `references/` for the Allow flow, driving helpers, the workflows that matter
+(attach / bg drive / switch tabs / SPA reads / shim HTTP / detach), command
+reference, and the chad-browser comparison. Multi-agent parallelization is
+intentionally out of scope — use chad-browser for that.
