@@ -28,6 +28,18 @@ On a live Google Chrome default profile:
 - The browser WebSocket from `DevToolsActivePort` **does** work after Allow
 - Tools that require an HTTP discovery endpoint therefore need a shim
 
+## Background / no focus steal (default)
+
+By default (`HC_BG=1` / `--bg`), headcrab:
+
+- creates tabs with `Target.createTarget({ background: true })`
+- never auto-calls `Target.activateTarget` / `Page.bringToFront`
+- enables `Emulation.setFocusEmulationEnabled` so pages still think they have focus
+
+Pass `--fg` / `HC_BG=0` only when you intentionally want Chrome raised.
+
+Synthetic `Input.dispatch*` clicks/typing can still raise the window on some WMs — prefer DOM/`evalInPage` when possible.
+
 ## What chrome-headcrab does
 
 ```

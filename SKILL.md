@@ -9,7 +9,9 @@ description: >
   "attach to chrome", "drive my real chrome", "google chrome cdp", "headcrab".
 references:
   - attach-and-allow
+  - driving
   - commands
+  - workflows
   - vs-chad-browser
 ---
 
@@ -68,6 +70,7 @@ the inspect UI flow above for the daily profile.
 
 ```bash
 # 1. Latch on (Allow dialog appears ONCE — click Allow)
+#    --bg is default: headed Chrome, no OS focus steal on new tabs
 chrome-headcrab attach --name live
 
 # 2. Drive through the held driver — no more Allow prompts
@@ -80,6 +83,10 @@ JS
 # 3. Detach the driver only (Chrome keeps running; next attach re-prompts)
 chrome-headcrab detach live
 ```
+
+Background mode (`HC_BG=1` / `--bg`, default) uses `Target.createTarget({ background: true })`
++ focus emulation. Pass `--fg` only when you intentionally want Chrome raised.
+See `references/driving.md` for the full helper surface (ported from chad-browser).
 
 `attach` also starts (or reuses) an HTTP discovery shim on `:9224` because
 Chrome's raw `:9222` HTTP `/json` endpoints 404 under this flow. Browser tools
@@ -120,5 +127,5 @@ ln -sfn ~/work/chrome-headcrab/bin/chrome-headcrab ~/.local/bin/chrome-headcrab
 
 Requires: `google-chrome`, `node` (v22+), `python3`.
 
-See `references/` for the Allow flow details, command reference, and the
-chad-browser comparison.
+See `references/` for the Allow flow, driving helpers (chad-parity), workflows,
+command reference, and the chad-browser comparison.

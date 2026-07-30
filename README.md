@@ -50,7 +50,9 @@ chrome-headcrab http --name live       # http://127.0.0.1:9224
 ## Docs
 
 - [`SKILL.md`](SKILL.md) — agent entrypoint
-- [`references/attach-and-allow.md`](references/attach-and-allow.md) — Chrome 144+ flow + gotchas
+- [`references/attach-and-allow.md`](references/attach-and-allow.md) — Chrome 144+ flow + gotchas + `--bg`
+- [`references/driving.md`](references/driving.md) — full eval/helper surface (chad-browser parity)
+- [`references/workflows.md`](references/workflows.md) — attach/drive recipes
 - [`references/commands.md`](references/commands.md) — CLI surface
 - [`references/vs-chad-browser.md`](references/vs-chad-browser.md) — when to use which
 

@@ -3,13 +3,18 @@
 ## attach (alias: up)
 
 ```bash
-chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim] [--force] [--json]
+chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim] [--bg|--fg] [--force] [--json]
 ```
 
 Latch onto Google Chrome. Shows the Allow dialog unless a live driver already
 exists for `--name`. Refuses to double-attach without `--force`.
 
-Prints: `NAME`, `CHROME_PORT`, `CHROME_WS`, `HTTP`, `SOCKET`, `DRIVER_PID`, …
+| Flag | Effect |
+|---|---|
+| `--bg` / `--background` | Default. New tabs via `background: true`; focus emulation ON; no auto-activate. |
+| `--fg` / `--foreground` | Intentionally raise Chrome on `createTarget` (sets `HC_BG=0`). |
+
+Prints: `NAME`, `CHROME_PORT`, `CHROME_WS`, `HTTP`, `SOCKET`, `DRIVER_PID`, `BG`, …
 
 ## detach (alias: down)
 
@@ -70,6 +75,7 @@ Reap dead runfiles / orphan driver sockets.
 | `HC_CHROME_PROFILE` | `~/.config/google-chrome` | Chrome user-data dir |
 | `HC_SHIM_PORT` | `9224` | HTTP discovery shim port |
 | `HC_NAME` | `live` | Default attach name |
+| `HC_BG` | `1` | Background / no OS focus steal. Set `0` for foreground. |
 | `HC_MEMORY_DIR` | `~/.cache/chrome-headcrab/memory` | Driver memory store |
 
 ## Paths

@@ -14,6 +14,7 @@
 #   chrome-headcrab → parasite your daily Google Chrome (real profile/tabs)
 #
 #   chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim]
+#                          [--bg|--fg] [--force]
 #   chrome-headcrab detach [name]
 #   chrome-headcrab status
 #   chrome-headcrab doctor
@@ -30,6 +31,8 @@
 #   HC_CHROME_PROFILE   default ~/.config/google-chrome
 #   HC_SHIM_PORT        default 9224
 #   HC_NAME             default live
+#   HC_BG               default 1 (background tabs / no OS focus steal).
+#                       Set to 0 or pass --fg to intentionally foreground.
 
 set -uo pipefail
 
@@ -41,6 +44,8 @@ MEMORY_DIR="$CACHEDIR/memory"
 SOCKDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/chrome-headcrab"
 DEFAULT_NAME="${HC_NAME:-live}"
 DEFAULT_SHIM_PORT="${HC_SHIM_PORT:-9224}"
+# Background / no-focus is the default. Only --fg / HC_BG=0 opts out.
+DEFAULT_BG="${HC_BG:-1}"
 
 _self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 ROOT="$(cd "$_self_dir/.." && pwd)"
@@ -161,16 +166,20 @@ cmd_status() {
 
 cmd_attach() {
   ensure_dirs
-  local name=$DEFAULT_NAME shim_port=$DEFAULT_SHIM_PORT use_shim=1 force=0 json=0
+  local name=$DEFAULT_NAME shim_port=$DEFAULT_SHIM_PORT use_shim=1 force=0 json=0 bg=$DEFAULT_BG
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name=$2; shift 2 ;;
       --shim-port) shim_port=$2; shift 2 ;;
       --no-shim) use_shim=0; shift ;;
+      --bg|--background) bg=1; shift ;;
+      --fg|--foreground|--steal-focus) bg=0; shift ;;
       --force) force=1; shift ;;
       --json) json=1; shift ;;
       -h|--help)
-        echo "usage: chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim] [--force]"
+        echo "usage: chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim] [--bg|--fg] [--force]"
+        echo "  --bg (default)  createTarget with background:true + focus emulation; avoid OS focus steal"
+        echo "  --fg            intentionally foreground Chrome on new tabs / createTarget"
         return 0 ;;
       *) die "unknown attach flag: $1" ;;
     esac
@@ -189,6 +198,7 @@ cmd_attach() {
         echo "HTTP=${HTTP:-}"
         echo "WS=${CHROME_WS:-}"
         echo "SOCKET=$SOCKET"
+        echo "BG=${BG:-?}"
         echo "→ drive: chrome-headcrab eval --name $name --page 'document.title'"
         echo "(use --force to reattach and re-trigger Allow)"
         return 0
@@ -205,47 +215,18 @@ cmd_attach() {
   browser_path=${_active[1]}
   local chrome_ws="ws://127.0.0.1:${chrome_port}${browser_path}"
 
-  # Prove Chrome answers CDP on the browser websocket before we spawn daemons.
-  python3 - "$chrome_ws" <<'PY' >/dev/null || die "Chrome WS not answering at $chrome_ws — is remote debugging enabled?"
-import asyncio, json, sys
-ws_url = sys.argv[1]
-async def main():
-    # Minimal handshake using stdlib only is painful; use websockets if present,
-    # else a raw upgrade is enough to prove the server is there.
-    try:
-        import websockets
-    except ImportError:
-        websockets = None
-    if websockets is not None:
-        async with websockets.connect(ws_url, open_timeout=3) as ws:
-            await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-            assert "result" in msg, msg
-            return
-    # Fallback: TCP connect + HTTP upgrade request; don't fully speak WS frames.
-    import urllib.parse
-    u = urllib.parse.urlparse(ws_url)
-    reader, writer = await asyncio.open_connection(u.hostname, u.port)
-    key = "dGhlIHNhbXBsZSBub25jZQ=="
-    req = (
-        f"GET {u.path} HTTP/1.1\r\n"
-        f"Host: {u.hostname}:{u.port}\r\n"
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    ).encode()
-    writer.write(req); await writer.drain()
-    status = await asyncio.wait_for(reader.readline(), timeout=3)
-    writer.close()
-    if b"101" not in status:
-        raise SystemExit(f"upgrade failed: {status!r}")
-asyncio.run(main())
-PY
+  # Cheap liveness only — NO WebSocket handshake here. Every fresh Chrome WS
+  # attach can re-fire the Allow dialog; the driver is the sole intentional client.
+  if ! (echo >/dev/tcp/127.0.0.1/"$chrome_port") >/dev/null 2>&1; then
+    die "Chrome not listening on :$chrome_port — enable chrome://inspect/#remote-debugging first"
+  fi
 
-  local shim_pid="" http="" discovery_ws="$chrome_ws"
+  local shim_pid="" http=""
   if (( use_shim )); then
     if (echo >/dev/tcp/127.0.0.1/"$shim_port") >/dev/null 2>&1; then
       # Reuse an already-running shim if it's ours / healthy.
-      if curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json/version" >/dev/null 2>&1          || curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json" >/dev/null 2>&1; then
+      if curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json/version" >/dev/null 2>&1 \
+          || curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json" >/dev/null 2>&1; then
         echo "chrome-headcrab: reusing discovery shim on :$shim_port" >&2
         http="http://127.0.0.1:${shim_port}"
       else
@@ -265,14 +246,18 @@ PY
         || { kill "$shim_pid" 2>/dev/null || true; die "shim up but /json/version failed"; }
       http="http://127.0.0.1:${shim_port}"
     fi
-    discovery_ws=$(curl -fsS --max-time 2 "http://127.0.0.1:${shim_port}/json/version" \
-      | python3 -c 'import sys,json; print(json.load(sys.stdin)["webSocketDebuggerUrl"])')
   fi
 
   local sock="$SOCKDIR/${name}.sock"
   rm -f "$sock"
   print_allow_banner
-  HC_MEMORY_DIR="$MEMORY_DIR" node "$DRIVER" "$chrome_ws" "$sock" >"$CACHEDIR/driver-${name}.log" 2>&1 &
+  if [[ "$bg" == "1" ]]; then
+    echo "chrome-headcrab: BACKGROUND mode ON (HC_BG=1) — new tabs should not steal OS focus" >&2
+  else
+    echo "chrome-headcrab: FOREGROUND mode (HC_BG=0) — createTarget may raise Chrome" >&2
+  fi
+  HC_MEMORY_DIR="$MEMORY_DIR" HC_BG="$bg" \
+    node "$DRIVER" "$chrome_ws" "$sock" >"$CACHEDIR/driver-${name}.log" 2>&1 &
   local driver_pid=$!
   if ! wait_for_socket "$sock" "$driver_pid"; then
     echo "chrome-headcrab: driver failed to come up. Last log:" >&2
@@ -320,6 +305,7 @@ SHIM_PORT=${shim_port}
 SHIM_PID=${shim_pid}
 DRIVER_PID=$driver_pid
 SOCKET=$sock
+BG=$bg
 ATTACHED_AT=$(date -Iseconds)
 EOF
 
@@ -339,6 +325,7 @@ PY
     [[ -n "$http" ]] && echo "HTTP=$http"
     echo "SOCKET=$sock"
     echo "DRIVER_PID=$driver_pid"
+    echo "BG=$bg"
     [[ -n "$shim_pid" ]] && echo "SHIM_PID=$shim_pid"
     echo "→ Keep this driver alive. Do NOT re-attach unless Chrome restarted."
     echo "→ Drive: chrome-headcrab eval --name $name --page 'document.title'"

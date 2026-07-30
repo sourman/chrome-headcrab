@@ -29,3 +29,14 @@ Both expose a Unix-socket JS eval driver over CDP. They solve different problems
 headcrab vendors the same driver surface as chad-browser (`session.*`,
 `evalInPage`, `waitForReady`, checkpoint/breadcrumb helpers) so agent muscle
 memory transfers. The CLI is intentionally smaller and attach-centric.
+
+## References parity
+
+| chad-browser | chrome-headcrab |
+|---|---|
+| `driving.md` | ported (+ `createPage` / bg helpers) |
+| `workflows.md` | adapted for attach/detach (not up/down browser) |
+| `commands.md` | attach-centric equivalent |
+| `auth-and-cdp.md` | **intentionally omitted** — headcrab uses live Google Chrome auth, not profile seeding / sqlite cookie snapshots |
+| (n/a) | `attach-and-allow.md` — Chrome 144+ Allow flow + discovery shim + `--bg` |
+| (n/a) | `vs-chad-browser.md` — this file |
