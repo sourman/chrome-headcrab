@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+# chrome-headcrab — latch onto your real Google Chrome once, then drive it forever
+# without re-triggering the Allow prompt.
+#
+# Why this exists:
+#   Chrome 144+ (stable 150 here) gate remote debugging behind
+#   chrome://inspect/#remote-debugging + an Allow dialog on each NEW CDP
+#   WebSocket attach. Re-attaching from scratch is extremely annoying.
+#   chrome-headcrab attaches ONCE, holds a persistent driver daemon on that
+#   authorized WebSocket, and all later eval/tabs/drive calls reuse it.
+#
+# This is the opposite of chad-browser:
+#   chad-browser  → launch isolated Chromium clones (ephemeral profiles)
+#   chrome-headcrab → parasite your daily Google Chrome (real profile/tabs)
+#
+#   chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim]
+#   chrome-headcrab detach [name]
+#   chrome-headcrab status
+#   chrome-headcrab doctor
+#   chrome-headcrab tabs [--name live]
+#   chrome-headcrab cdp  [--name live]
+#   chrome-headcrab http [--name live]     # discovery HTTP for browser tools
+#   chrome-headcrab eval [--name live] [--page] [--wait '<check>']
+#                        [--stdin|--file <f>|'<js>']
+#   chrome-headcrab script [--name live] [--page] [--wait '<check>'] <file>
+#   chrome-headcrab repl [--name live]
+#   chrome-headcrab gc
+#
+# Env:
+#   HC_CHROME_PROFILE   default ~/.config/google-chrome
+#   HC_SHIM_PORT        default 9224
+#   HC_NAME             default live
+
+set -uo pipefail
+
+PROFILE="${HC_CHROME_PROFILE:-$HOME/.config/google-chrome}"
+ACTIVE="$PROFILE/DevToolsActivePort"
+CACHEDIR="${XDG_CACHE_HOME:-$HOME/.cache}/chrome-headcrab"
+RUNDIR="$CACHEDIR/run"
+MEMORY_DIR="$CACHEDIR/memory"
+SOCKDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/chrome-headcrab"
+DEFAULT_NAME="${HC_NAME:-live}"
+DEFAULT_SHIM_PORT="${HC_SHIM_PORT:-9224}"
+
+_self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ROOT="$(cd "$_self_dir/.." && pwd)"
+DRIVER="$ROOT/lib/driver.mjs"
+SHIM="$ROOT/lib/cdp-shim.py"
+
+die() { echo "chrome-headcrab: $*" >&2; exit 1; }
+ensure_dirs() { mkdir -p "$CACHEDIR" "$RUNDIR" "$MEMORY_DIR" "$SOCKDIR"; }
+
+read_active() {
+  [[ -f "$ACTIVE" ]] || die "no DevToolsActivePort at $ACTIVE
+Enable remote debugging in Google Chrome first:
+  1. Open chrome://inspect/#remote-debugging
+  2. Turn remote debugging ON
+  3. Re-run: chrome-headcrab attach"
+  local port path
+  port=$(sed -n '1p' "$ACTIVE")
+  path=$(sed -n '2p' "$ACTIVE")
+  [[ -n "$port" && -n "$path" ]] || die "DevToolsActivePort malformed: $ACTIVE"
+  printf '%s\n%s\n' "$port" "$path"
+}
+
+runfile_for() { echo "$RUNDIR/${1}.env"; }
+
+load_run() {
+  local name=$1 f
+  f=$(runfile_for "$name")
+  [[ -f "$f" ]] || die "not attached as '$name' (run: chrome-headcrab attach --name $name)"
+  # shellcheck disable=SC1090
+  source "$f"
+}
+
+wait_for_socket() {
+  local sock=$1 pid=$2 i
+  for i in $(seq 1 100); do
+    [[ -S "$sock" ]] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_port() {
+  local port=$1 i
+  for i in $(seq 1 50); do
+    (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+is_alive() { kill -0 "$1" 2>/dev/null; }
+
+print_allow_banner() {
+  cat >&2 <<'EOF'
+
+════════════════════════════════════════════════════════════
+ chrome-headcrab is attaching to Google Chrome NOW.
+ Look for the Allow remote debugging dialog and click Allow.
+ This should be the ONLY time you see it for this session.
+════════════════════════════════════════════════════════════
+
+EOF
+}
+
+cmd_doctor() {
+  echo "PROFILE=$PROFILE"
+  echo "ACTIVE=$ACTIVE"
+  if [[ -f "$ACTIVE" ]]; then
+    echo "DevToolsActivePort:"
+    sed 's/^/  /' "$ACTIVE"
+  else
+    echo "DevToolsActivePort: MISSING"
+  fi
+  echo "Chrome listeners:"
+  ss -ltnp 2>/dev/null | awk '/google-chrome|chrome"/ || /9222|9224/ {print "  "$0}' || true
+  local name=${1:-$DEFAULT_NAME} f
+  f=$(runfile_for "$name")
+  if [[ -f "$f" ]]; then
+    echo "Runfile $f:"
+    sed 's/^/  /' "$f"
+    # shellcheck disable=SC1090
+    source "$f"
+    echo "driver alive: $(is_alive "${DRIVER_PID:-0}" && echo yes || echo NO)"
+    echo "shim alive:   $( [[ -n "${SHIM_PID:-}" ]] && is_alive "$SHIM_PID" && echo yes || echo "${SHIM_PID:-none}")"
+    echo "socket:       ${SOCKET:-} ($( [[ -n "${SOCKET:-}" && -S "${SOCKET:-}" ]] && echo present || echo MISSING))"
+  else
+    echo "Runfile: none for name=$name"
+  fi
+  echo
+  echo "If attach will prompt: open chrome://inspect/#remote-debugging and ensure Enabled."
+}
+
+cmd_status() {
+  ensure_dirs
+  local f name alive driver_ok shim_ok
+  printf '%-12s %-8s %-8s %-8s %-6s %s\n' NAME DRIVER SHIM HTTP WS CHROME
+  shopt -s nullglob
+  local files=("$RUNDIR"/*.env)
+  if ((${#files[@]} == 0)); then
+    echo "(not attached)"
+    return 0
+  fi
+  for f in "${files[@]}"; do
+    # shellcheck disable=SC1090
+    source "$f"
+    name=${NAME:-$(basename "$f" .env)}
+    driver_ok=no; shim_ok=-; 
+    is_alive "${DRIVER_PID:-0}" && driver_ok=yes
+    if [[ -n "${SHIM_PID:-}" ]]; then
+      shim_ok=no
+      is_alive "$SHIM_PID" && shim_ok=yes
+    fi
+    printf '%-12s %-8s %-8s %-8s %-6s %s\n' \
+      "$name" "$driver_ok" "$shim_ok" "${HTTP:-}" "${CHROME_PORT:-}" "${CHROME_WS:-}"
+  done
+}
+
+cmd_attach() {
+  ensure_dirs
+  local name=$DEFAULT_NAME shim_port=$DEFAULT_SHIM_PORT use_shim=1 force=0 json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      --shim-port) shim_port=$2; shift 2 ;;
+      --no-shim) use_shim=0; shift ;;
+      --force) force=1; shift ;;
+      --json) json=1; shift ;;
+      -h|--help)
+        echo "usage: chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim] [--force]"
+        return 0 ;;
+      *) die "unknown attach flag: $1" ;;
+    esac
+  done
+
+  local f; f=$(runfile_for "$name")
+  if [[ -f "$f" ]]; then
+    # shellcheck disable=SC1090
+    source "$f"
+    if is_alive "${DRIVER_PID:-0}" && [[ -S "${SOCKET:-/}" ]]; then
+      if (( force )); then
+        echo "chrome-headcrab: --force detach of existing '$name' (will re-prompt Allow)" >&2
+        cmd_detach "$name" || true
+      else
+        echo "already attached as '$name' (driver pid $DRIVER_PID)"
+        echo "HTTP=${HTTP:-}"
+        echo "WS=${CHROME_WS:-}"
+        echo "SOCKET=$SOCKET"
+        echo "→ drive: chrome-headcrab eval --name $name --page 'document.title'"
+        echo "(use --force to reattach and re-trigger Allow)"
+        return 0
+      fi
+    else
+      echo "chrome-headcrab: stale runfile for '$name'; cleaning" >&2
+      cmd_detach "$name" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local chrome_port browser_path
+  mapfile -t _active < <(read_active)
+  chrome_port=${_active[0]}
+  browser_path=${_active[1]}
+  local chrome_ws="ws://127.0.0.1:${chrome_port}${browser_path}"
+
+  # Prove Chrome answers CDP on the browser websocket before we spawn daemons.
+  python3 - "$chrome_ws" <<'PY' >/dev/null || die "Chrome WS not answering at $chrome_ws — is remote debugging enabled?"
+import asyncio, json, sys
+ws_url = sys.argv[1]
+async def main():
+    # Minimal handshake using stdlib only is painful; use websockets if present,
+    # else a raw upgrade is enough to prove the server is there.
+    try:
+        import websockets
+    except ImportError:
+        websockets = None
+    if websockets is not None:
+        async with websockets.connect(ws_url, open_timeout=3) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            assert "result" in msg, msg
+            return
+    # Fallback: TCP connect + HTTP upgrade request; don't fully speak WS frames.
+    import urllib.parse
+    u = urllib.parse.urlparse(ws_url)
+    reader, writer = await asyncio.open_connection(u.hostname, u.port)
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    req = (
+        f"GET {u.path} HTTP/1.1\r\n"
+        f"Host: {u.hostname}:{u.port}\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    writer.write(req); await writer.drain()
+    status = await asyncio.wait_for(reader.readline(), timeout=3)
+    writer.close()
+    if b"101" not in status:
+        raise SystemExit(f"upgrade failed: {status!r}")
+asyncio.run(main())
+PY
+
+  local shim_pid="" http="" discovery_ws="$chrome_ws"
+  if (( use_shim )); then
+    if (echo >/dev/tcp/127.0.0.1/"$shim_port") >/dev/null 2>&1; then
+      # Reuse an already-running shim if it's ours / healthy.
+      if curl -fsS --max-time 1 "http://127.0.0.1:${shim_port}/json/version" >/dev/null 2>&1; then
+        echo "chrome-headcrab: reusing discovery shim on :$shim_port" >&2
+        http="http://127.0.0.1:${shim_port}"
+      else
+        die "port $shim_port busy but not a healthy CDP discovery shim; free it or pass --shim-port"
+      fi
+    else
+      HC_SHIM_PORT="$shim_port" HC_CHROME_PROFILE="$PROFILE" \
+        python3 -u "$SHIM" >"$CACHEDIR/shim-${name}.log" 2>&1 &
+      shim_pid=$!
+      if ! wait_for_port "$shim_port"; then
+        kill "$shim_pid" 2>/dev/null || true
+        die "shim failed to bind :$shim_port (see $CACHEDIR/shim-${name}.log)"
+      fi
+      # Give /json/version a moment; first request can race Chrome Target.getTargets.
+      sleep 0.3
+      curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json/version" >/dev/null \
+        || { kill "$shim_pid" 2>/dev/null || true; die "shim up but /json/version failed"; }
+      http="http://127.0.0.1:${shim_port}"
+    fi
+    discovery_ws=$(curl -fsS --max-time 2 "http://127.0.0.1:${shim_port}/json/version" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["webSocketDebuggerUrl"])')
+  fi
+
+  local sock="$SOCKDIR/${name}.sock"
+  rm -f "$sock"
+  print_allow_banner
+  HC_MEMORY_DIR="$MEMORY_DIR" node "$DRIVER" "$chrome_ws" "$sock" >"$CACHEDIR/driver-${name}.log" 2>&1 &
+  local driver_pid=$!
+  if ! wait_for_socket "$sock" "$driver_pid"; then
+    echo "chrome-headcrab: driver failed to come up. Last log:" >&2
+    tail -n 40 "$CACHEDIR/driver-${name}.log" >&2 || true
+    [[ -n "$shim_pid" ]] && kill "$shim_pid" 2>/dev/null || true
+    die "driver did not create $sock — did you click Allow? see doctor"
+  fi
+
+  # Smoke: one Browser.getVersion through the held socket proves Allow succeeded.
+  if ! python3 - "$sock" >/dev/null <<'PY'
+import socket, json, sys
+sock_path = sys.argv[1]
+code = "return await session.Browser.getVersion()"
+req = json.dumps({"eval": code, "timeout": 10000}) + "\n"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(15)
+s.connect(sock_path)
+s.sendall(req.encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = s.recv(65536)
+    if not chunk: break
+    buf += chunk
+s.close()
+resp = json.loads(buf.decode() or "{}")
+if resp.get("error"):
+    raise SystemExit(resp["error"])
+if "value" not in resp:
+    raise SystemExit(f"unexpected driver response: {resp!r}")
+PY
+  then
+    kill "$driver_pid" 2>/dev/null || true
+    [[ -n "$shim_pid" ]] && kill "$shim_pid" 2>/dev/null || true
+    rm -f "$sock"
+    die "attached socket exists but Browser.getVersion failed — Allow denied or Chrome closed CDP"
+  fi
+
+  cat >"$f" <<EOF
+NAME=$name
+CHROME_PORT=$chrome_port
+CHROME_PATH=$browser_path
+CHROME_WS=$chrome_ws
+HTTP=${http}
+SHIM_PORT=${shim_port}
+SHIM_PID=${shim_pid}
+DRIVER_PID=$driver_pid
+SOCKET=$sock
+ATTACHED_AT=$(date -Iseconds)
+EOF
+
+  if (( json )); then
+    python3 - "$name" "$chrome_port" "$chrome_ws" "${http}" "$sock" "$driver_pid" "${shim_pid}" <<'PY'
+import json, sys
+name, port, ws, http, sock, dpid, spid = sys.argv[1:]
+print(json.dumps({
+  "name": name, "chrome_port": int(port), "chrome_ws": ws, "http": http or None,
+  "socket": sock, "driver_pid": int(dpid), "shim_pid": int(spid) if spid else None,
+}, indent=2))
+PY
+  else
+    echo "NAME=$name"
+    echo "CHROME_PORT=$chrome_port"
+    echo "CHROME_WS=$chrome_ws"
+    [[ -n "$http" ]] && echo "HTTP=$http"
+    echo "SOCKET=$sock"
+    echo "DRIVER_PID=$driver_pid"
+    [[ -n "$shim_pid" ]] && echo "SHIM_PID=$shim_pid"
+    echo "→ Keep this driver alive. Do NOT re-attach unless Chrome restarted."
+    echo "→ Drive: chrome-headcrab eval --name $name --page 'document.title'"
+    echo "→ Tabs:  chrome-headcrab tabs --name $name"
+    [[ -n "$http" ]] && echo "→ Browser-tool discovery: $http  (not raw :$chrome_port)"
+  fi
+}
+
+cmd_detach() {
+  local name=${1:-$DEFAULT_NAME}
+  local f; f=$(runfile_for "$name")
+  if [[ ! -f "$f" ]]; then
+    echo "chrome-headcrab: nothing attached as '$name'"
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  source "$f"
+  [[ -n "${DRIVER_PID:-}" ]] && kill "$DRIVER_PID" 2>/dev/null || true
+  [[ -n "${SOCKET:-}" ]] && { pkill -f "driver.mjs.*${SOCKET}" 2>/dev/null || true; rm -f "$SOCKET"; }
+  # Only kill shim if we started it (have SHIM_PID) and no other runfile shares it.
+  if [[ -n "${SHIM_PID:-}" ]]; then
+    local shared=0 other
+    for other in "$RUNDIR"/*.env; do
+      [[ -f "$other" && "$other" != "$f" ]] || continue
+      if grep -q "^SHIM_PID=${SHIM_PID}$" "$other" 2>/dev/null; then shared=1; break; fi
+    done
+    if (( ! shared )); then
+      kill "$SHIM_PID" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$f"
+  echo "detached '$name' (Chrome itself left running)"
+  echo "note: next attach will show the Allow dialog again"
+}
+
+resolve_socket() {
+  local id=${1:-$DEFAULT_NAME}
+  load_run "$id"
+  is_alive "${DRIVER_PID:-0}" || die "driver for '$NAME' is dead — re-run attach (Allow will prompt)"
+  [[ -n "${SOCKET:-}" && -S "$SOCKET" ]] || die "socket missing for '$NAME' — re-run attach"
+  echo "$SOCKET"
+}
+
+cmd_cdp() {
+  local name=$DEFAULT_NAME
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      *) die "unknown cdp flag: $1" ;;
+    esac
+  done
+  load_run "$name"
+  echo "$CHROME_WS"
+}
+
+cmd_http() {
+  local name=$DEFAULT_NAME
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      *) die "unknown http flag: $1" ;;
+    esac
+  done
+  load_run "$name"
+  [[ -n "${HTTP:-}" ]] || die "no discovery HTTP for '$name' (attached with --no-shim?)"
+  echo "$HTTP"
+}
+
+cmd_tabs() {
+  local name=$DEFAULT_NAME
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      *) die "unknown tabs flag: $1" ;;
+    esac
+  done
+  local sock; sock=$(resolve_socket "$name") || exit 1
+  python3 - "$sock" <<'PY'
+import socket, json, sys
+sock_path = sys.argv[1]
+code = r'''
+const targets = await session.Target.getTargets();
+const pages = (targets.targetInfos || [])
+  .filter(t => t.type === 'page' || t.type === 'tab')
+  .map(t => ({ id: t.targetId, type: t.type, title: t.title, url: t.url, attached: t.attached }));
+return pages;
+'''
+req = json.dumps({"eval": code, "timeout": 15000}) + "\n"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(20)
+s.connect(sock_path)
+s.sendall(req.encode())
+buf = b""
+while not buf.endswith(b"\n"):
+    chunk = s.recv(1 << 20)
+    if not chunk: break
+    buf += chunk
+s.close()
+resp = json.loads(buf.decode() or "{}")
+if resp.get("error"):
+    print(resp["error"], file=sys.stderr); sys.exit(1)
+pages = resp.get("result", resp)
+if isinstance(pages, dict) and "result" in pages:
+    pages = pages["result"]
+for i, p in enumerate(pages or []):
+    print(f"{i}\t{p.get('title','')}\t{p.get('url','')}\t{p.get('id','')}")
+PY
+}
+
+cmd_eval() {
+  local id=$DEFAULT_NAME page=0 wait="" timeout="" code="" file="" use_stdin=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|--name) id=$2; shift 2 ;;
+      --page) page=1; shift ;;
+      --wait) wait=$2; shift 2 ;;
+      --timeout) timeout=$2; shift 2 ;;
+      --stdin) use_stdin=1; shift ;;
+      --file) file=$2; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+usage: chrome-headcrab eval [--name live] [--page] [--wait '<check>'] [--stdin|--file f|'<js>']
+EOF
+        return 0 ;;
+      *)
+        if [[ -z "$code" && "$1" != --* ]]; then code=$1; shift; else die "unknown eval flag: $1"; fi
+        ;;
+    esac
+  done
+  if (( use_stdin )); then code=$(cat)
+  elif [[ -n "$file" ]]; then code=$(cat "$file")
+  fi
+  [[ -n "$code" ]] || die "eval needs JS (--stdin, --file, or positional)"
+
+  local sock; sock=$(resolve_socket "$id") || exit 1
+  local timeout_json=""
+  if [[ -n "$timeout" ]]; then
+    timeout_json=$(python3 -c 'import json,sys; print(","+json.dumps({"timeout": int(sys.argv[1])})[1:-1])' "$timeout")
+  fi
+  python3 - "$sock" "$code" "$timeout_json" "$page" "$wait" <<'PY'
+import socket, json, sys
+sock_path, code, timeout_json, page_flag, wait_expr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+
+def js_str_dq(s):
+    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+if page_flag:
+    stripped = code.strip()
+    needs_iife = (';' in stripped) or stripped.startswith('return') or stripped.startswith('{') or stripped.startswith('await')
+    inner = js_str_dq(code)
+    body = f'return evalInPage("(async () => {{ {inner} }})()")' if needs_iife else f'return evalInPage("{inner}")'
+    if wait_expr:
+        wait_inner = js_str_dq(wait_expr)
+        wait_to = 15000
+        if timeout_json:
+            try:
+                body_ms = json.loads('{' + timeout_json.strip().lstrip(',').strip() + '}')['timeout']
+                wait_to = max(500, min(15000, body_ms - 500))
+            except Exception:
+                pass
+        code = f'await waitForReady({{ check: "{wait_inner}", timeout: {wait_to}, hint: "--wait check" }});\n{body}'
+    else:
+        code = body
+elif wait_expr:
+    wait_inner = js_str_dq(wait_expr)
+    wait_to = 15000
+    if timeout_json:
+        try:
+            body_ms = json.loads('{' + timeout_json.strip().lstrip(',').strip() + '}')['timeout']
+            wait_to = max(500, min(15000, body_ms - 500))
+        except Exception:
+            pass
+    code = f'await waitForReady({{ check: "{wait_inner}", timeout: {wait_to}, hint: "--wait check" }});\n' + code
+
+client_timeout = 120
+if timeout_json:
+    try:
+        body_ms = json.loads('{' + timeout_json.strip().lstrip(',').strip() + '}')['timeout']
+        client_timeout = max(120, (body_ms // 1000) + 10)
+    except Exception:
+        pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(client_timeout)
+try:
+    s.connect(sock_path)
+except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+    sys.stdout.write(json.dumps({"error": f"driver socket refused ({e}) — run chrome-headcrab status / attach"}) + "\n")
+    sys.exit(1)
+payload = json.dumps({"eval": code})
+if timeout_json:
+    payload = payload[:-1] + timeout_json + "}"
+s.sendall((payload + "\n").encode())
+buf = b""
+try:
+    while b"\n" not in buf:
+        chunk = s.recv(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+except socket.timeout:
+    sys.stdout.write(json.dumps({"error": "client socket timed out waiting for driver"}) + "\n")
+    sys.exit(1)
+finally:
+    s.close()
+sys.stdout.write(buf.decode() if buf else '{"error":"no response from driver"}\n')
+try:
+    resp = json.loads(buf.decode() or "{}")
+    if isinstance(resp, dict) and resp.get("error"):
+        sys.exit(2)
+except Exception:
+    pass
+PY
+
+}
+
+cmd_script() {
+  local fwd=() file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|--name|--wait|--timeout) fwd+=("$1" "$2"); shift 2 ;;
+      --page) fwd+=("$1"); shift ;;
+      *) file=$1; shift; break ;;
+    esac
+  done
+  [[ -n "$file" && -f "$file" ]] || die "script needs a JS file"
+  local code; code=$(cat "$file")
+  cmd_eval "${fwd[@]}" "$code"
+}
+
+cmd_repl() {
+  local id=$DEFAULT_NAME
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|--name) id=$2; shift 2 ;;
+      *) die "unknown repl flag: $1" ;;
+    esac
+  done
+  local sock; sock=$(resolve_socket "$id") || exit 1
+  echo "chrome-headcrab repl → $sock  (.exit or Ctrl-D to exit)"
+  while IFS= read -r -e -p "hc> " line; do
+    [[ "$line" == ".exit" || "$line" == "exit" ]] && break
+    [[ -z "$line" ]] && continue
+    cmd_eval --name "$id" "$line" || true
+  done
+}
+
+cmd_gc() {
+  ensure_dirs
+  local f
+  shopt -s nullglob
+  for f in "$RUNDIR"/*.env; do
+    # shellcheck disable=SC1090
+    source "$f"
+    if ! is_alive "${DRIVER_PID:-0}"; then
+      echo "reaping dead attach $(basename "$f" .env)"
+      cmd_detach "$(basename "$f" .env)" >/dev/null || true
+    fi
+  done
+  # Orphan sockets
+  local sock
+  for sock in "$SOCKDIR"/*.sock; do
+    [[ -e "$sock" ]] || continue
+    if ! grep -qF "$sock" "$RUNDIR"/*.env 2>/dev/null; then
+      echo "removing orphan socket $sock"
+      pkill -f "driver.mjs.*${sock}" 2>/dev/null || true
+      rm -f "$sock"
+    fi
+  done
+}
+
+usage() {
+  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd=${1:-}; shift || true
+  case "$cmd" in
+    attach|up) detach_alias=0; cmd_attach "$@" ;;
+    detach|down) cmd_detach "$@" ;;
+    status|list) cmd_status "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    tabs) cmd_tabs "$@" ;;
+    cdp) cmd_cdp "$@" ;;
+    http) cmd_http "$@" ;;
+    eval) cmd_eval "$@" ;;
+    script) cmd_script "$@" ;;
+    repl) cmd_repl "$@" ;;
+    gc) cmd_gc "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
