@@ -245,7 +245,7 @@ PY
   if (( use_shim )); then
     if (echo >/dev/tcp/127.0.0.1/"$shim_port") >/dev/null 2>&1; then
       # Reuse an already-running shim if it's ours / healthy.
-      if curl -fsS --max-time 1 "http://127.0.0.1:${shim_port}/json/version" >/dev/null 2>&1; then
+      if curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json/version" >/dev/null 2>&1          || curl -fsS --max-time 3 "http://127.0.0.1:${shim_port}/json" >/dev/null 2>&1; then
         echo "chrome-headcrab: reusing discovery shim on :$shim_port" >&2
         http="http://127.0.0.1:${shim_port}"
       else
@@ -440,11 +440,19 @@ s.close()
 resp = json.loads(buf.decode() or "{}")
 if resp.get("error"):
     print(resp["error"], file=sys.stderr); sys.exit(1)
-pages = resp.get("result", resp)
+pages = resp.get("value", resp.get("result", resp))
+if isinstance(pages, dict) and "targetInfos" in pages:
+    pages = [t for t in pages["targetInfos"] if t.get("type") in ("page", "tab")]
 if isinstance(pages, dict) and "result" in pages:
     pages = pages["result"]
-for i, p in enumerate(pages or []):
-    print(f"{i}\t{p.get('title','')}\t{p.get('url','')}\t{p.get('id','')}")
+if not isinstance(pages, list):
+    print(f"unexpected tabs payload: {pages!r}", file=sys.stderr)
+    sys.exit(1)
+for i, page in enumerate(pages or []):
+    if not isinstance(page, dict):
+        print(f"{i}\t{page}")
+        continue
+    print(f"{i}\t{page.get('title','')}\t{page.get('url','')}\t{page.get('id','')}")
 PY
 }
 
