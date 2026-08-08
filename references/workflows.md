@@ -90,4 +90,4 @@ chrome-headcrab detach <name>     # drop driver + our shim; NEVER kills Chrome
 chrome-headcrab gc                # reap dead runfiles / orphan sockets
 ```
 
-Unlike chad-browser, `detach` must **not** quit Google Chrome.
+`detach` never quits Google Chrome — it only drops the driver (and our shim).

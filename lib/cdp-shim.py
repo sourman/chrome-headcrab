@@ -5,7 +5,7 @@ Chrome on :9222 (DevToolsActivePort) speaks CDP over the browser websocket, but:
   - HTTP /json/* returns 404
   - WS upgrades that include an Origin header get 403
 
-Puppeteer/connectOverCDP needs both. This shim restores chad-browser-style attach:
+Puppeteer/connectOverCDP needs both. This shim provides a headcrab-native HTTP /json facade for tools that need discovery:
   client  ->  http://127.0.0.1:9224  ->  discovery JSON
   client  ->  ws://127.0.0.1:9224/...  ->  Chrome :9222 (Origin stripped)
 """

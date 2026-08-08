@@ -1,13 +1,13 @@
 # chrome-headcrab — driving the page
 
-> **chrome-headcrab note:** same driver surface as chad-browser. The browser is
-> already running — you attach once (`chrome-headcrab attach`), then drive.
-> Background / no-focus mode is **ON by default** (`HC_BG=1` / `--bg`). Prefer
-> `createPage(url)` / `use(targetId)` / `evalInPage` over `Input.dispatch*` and
-> never call `activateTarget`/`bringToFront` unless the user wants Chrome raised.
+> **chrome-headcrab note:** The browser is already running — you attach once
+> (`chrome-headcrab attach`), then drive. Background / no-focus mode is **ON by
+> default** (`HC_BG=1` / `--bg`). Prefer `createPage(url)` / `use(targetId)` /
+> `evalInPage` over `Input.dispatch*` and never call `activateTarget` /
+> `bringToFront` unless the user wants Chrome raised.
 >
-> There is **no multi-agent parallelization** here. One Google Chrome, one held
-> driver. For isolated / disposable browsers use **chad-browser**.
+> This skill is **single-session only**. One Google Chrome, one held driver —
+> no multi-agent parallelization or isolated browser clones.
 
 The `eval` subcommand runs JS in one of two contexts:
 
@@ -43,9 +43,9 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `captureRequests(urlPattern, fn, opts?)` | Run `fn` while collecting network requests whose URL matches `urlPattern` (substring or RegExp). Returns `{ requests, count }`. See [Network events](#network-events--capturing-requests). |
 | `snapshotInteractive({ max? })` | Return `{ url, title, count, elements }` for all visible interactive elements on the page (links, buttons, inputs, selects, `[role]`, `[tabindex]`). Each element is a compact object (`{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`). Use this instead of dumping `outerHTML` — you get the signal without the noise. |
 | `checkpoint` | Deep-freeze object. `checkpoint.save({ label })` captures cookies + localStorage + sessionStorage + URL + scroll to disk. `checkpoint.restore(idOrLabel)` reloads it. `.list()`, `.remove(idOrLabel)`. See [Checkpoints](#checkpoints--deep-freeze-state). |
-| `breadcrumb` | Action recorder. `breadcrumb.start({ label })` subscribes to nav/POST events. `.note(action, detail)` records manual actions. `.snapshot()` / `.stop()` write to disk. `.replay(idOrLabel)` replays navigations on a fresh browser (manual steps returned in `manualSteps`). `.list()`, `.remove(idOrLabel)`. See [Breadcrumbs](#breadcrumbs--record-and-replay-the-journey). |
+| `breadcrumb` | Action recorder. `breadcrumb.start({ label })` subscribes to nav/POST events. `.note(action, detail)` records manual actions. `.snapshot()` / `.stop()` write to disk. `.replay(idOrLabel)` replays navigations on the current attached session (manual steps returned in `manualSteps`). `.list()`, `.remove(idOrLabel)`. See [Breadcrumbs](#breadcrumbs--record-and-replay-the-journey). |
 
-`session` auto-routes to the active page target (set during `up`). Browser-level
+`session` auto-routes to the active page target (set during `attach`). Browser-level
 methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denied
 — you have the full CDP surface, including `Network`, `Page.captureScreenshot`,
 `Browser.setDownloadBehavior`, `Target.attachToTarget`.
@@ -349,14 +349,14 @@ return { dest, ...result };
 Set the download behavior before clicking the download trigger:
 
 ```js
-await session.Browser.setDownloadBehavior({ behavior: 'allow', downloadPath: '/tmp/chad-downloads' });
+await session.Browser.setDownloadBehavior({ behavior: 'allow', downloadPath: '/tmp/chrome-headcrab-downloads' });
 // ...click the export button, fill the form, click "Generate CSV"...
 // The download is async on the browser side; sleep briefly to let it start,
 // then verify on disk from the shell after eval returns.
 await new Promise(r => setTimeout(r, 2000));
 ```
 
-Then from bash: `ls -la /tmp/chad-downloads/` to confirm the file landed. For
+Then from bash: `ls -la /tmp/chrome-headcrab-downloads/` to confirm the file landed. For
 robust verification, poll the directory from bash (Node can't easily stat the
 file inside the driver context).
 
@@ -600,15 +600,6 @@ return checkpoint.list();
 await checkpoint.remove('after-login-and-filter');  // delete the file
 ```
 
-### CLI shortcuts
-
-```bash
-chrome-headcrab checkpoint save "label" --name X       # = checkpoint.save({label})
-chrome-headcrab checkpoint restore <id-or-label> --name X
-chrome-headcrab checkpoint list --name X
-chrome-headcrab checkpoint rm <id-or-label> --name X
-```
-
 Files: `~/.cache/chrome-headcrab/checkpoints/cp_*.json` (the label lives inside the
 JSON only, never the filename).
 
@@ -616,8 +607,8 @@ JSON only, never the filename).
 
 - **Roll back after a destructive action** — save before delete/submit, restore
   to undo.
-- **Skip a long login + nav flow on a fresh browser** — save once, restore on
-  each new instance.
+- **Skip a long login + nav flow later in this session** — save once, restore
+  after a destructive step or re-nav.
 - **Capture state for offline inspection** — the JSON is plain, read it with
   file tools.
 
@@ -625,7 +616,7 @@ JSON only, never the filename).
 
 `breadcrumb` records the **meaningful actions** of a session (top-frame
 navigations via CDP events, POST requests, and manual `note`s for clicks/types)
-and replays the restorable ones on a fresh browser. Complements checkpoints:
+and replays the restorable ones on the current attached session. Complements checkpoints:
 breadcrumbs replay the *journey*, checkpoints restore the *destination*.
 
 ### `breadcrumb.start({ label })` → `{ id, label, path, recording }`
@@ -694,18 +685,6 @@ return breadcrumb.list();
 await breadcrumb.remove('policy-draft-flow');
 ```
 
-### CLI shortcuts
-
-```bash
-chrome-headcrab breadcrumb start "label" --name X
-chrome-headcrab breadcrumb note click '{"selector":"#btn"}' --name X
-chrome-headcrab breadcrumb snapshot --name X
-chrome-headcrab breadcrumb stop --name X
-chrome-headcrab breadcrumb replay <id-or-label> --name X
-chrome-headcrab breadcrumb list --name X
-chrome-headcrab breadcrumb rm <id-or-label> --name X
-```
-
 Files: `~/.cache/chrome-headcrab/breadcrumbs/bc_*.json`.
 
 ### When to use breadcrumbs vs checkpoints
@@ -713,7 +692,7 @@ Files: `~/.cache/chrome-headcrab/breadcrumbs/bc_*.json`.
 | Goal | Use |
 |---|---|
 | Roll back after a destructive action | **checkpoint** save → act → restore |
-| Skip a long login + nav flow on a fresh browser | **checkpoint** save once → restore on each new browser |
+| Skip a long login + nav flow later in this session | **checkpoint** save once → restore in-place / after re-nav |
 | Reproduce a multi-step journey on a clean slate | **breadcrumb** record → replay (redo `manualSteps`) |
 | Capture state for offline inspection | **checkpoint** save (the JSON is readable) |
 | Resume a flow that needs real clicks in order | **breadcrumb** replay navigations, redo `manualSteps` |

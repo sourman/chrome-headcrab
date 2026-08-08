@@ -61,8 +61,9 @@ chrome-headcrab script [--name live] [--page] [--wait '<check>'] <file.js>
 chrome-headcrab repl [--name live]
 ```
 
-Same semantics as chad-browser: `--page` runs in page context; default is Node
-context with `session.*` and helpers.
+`--page` runs the JS in the page context (`document.querySelector(...)` works
+directly). Default is Node context with `session.*` and the driver helpers in
+scope.
 
 ## gc
 
@@ -77,6 +78,8 @@ Reap dead runfiles / orphan driver sockets.
 | `HC_NAME` | `live` | Default attach name |
 | `HC_BG` | `1` | Background / no OS focus steal. Set `0` for foreground. |
 | `HC_MEMORY_DIR` | `~/.cache/chrome-headcrab/memory` | Driver memory store |
+| `HC_CHECKPOINT_DIR` | `~/.cache/chrome-headcrab/checkpoints` | Checkpoint JSON store |
+| `HC_BREADCRUMB_DIR` | `~/.cache/chrome-headcrab/breadcrumbs` | Breadcrumb JSON store |
 
 ## Paths
 

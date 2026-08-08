@@ -3,15 +3,14 @@
 # without re-triggering the Allow prompt.
 #
 # Why this exists:
-#   Chrome 144+ (stable 150 here) gate remote debugging behind
+#   Chrome 144+ gates remote debugging behind
 #   chrome://inspect/#remote-debugging + an Allow dialog on each NEW CDP
 #   WebSocket attach. Re-attaching from scratch is extremely annoying.
 #   chrome-headcrab attaches ONCE, holds a persistent driver daemon on that
 #   authorized WebSocket, and all later eval/tabs/drive calls reuse it.
 #
-# This is the opposite of chad-browser:
-#   chad-browser  → launch isolated Chromium clones (ephemeral profiles)
-#   chrome-headcrab → parasite your daily Google Chrome (real profile/tabs)
+# It parasites your daily Google Chrome (real profile/tabs) rather than
+# launching an isolated browser.
 #
 #   chrome-headcrab attach [--name live] [--shim-port 9224] [--no-shim]
 #                          [--bg|--fg] [--force]
