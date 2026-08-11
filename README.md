@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="chrome-headcrab logo" width="240">
+</p>
+
 # chrome-headcrab
 
 Latch onto your **real Google Chrome** once (Chrome 144+ Allow dialog), hold a
