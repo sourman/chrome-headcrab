@@ -56,6 +56,3 @@ chrome-headcrab http --name live       # http://127.0.0.1:9224
 - [`references/workflows.md`](references/workflows.md) — attach/drive recipes
 - [`references/commands.md`](references/commands.md) — CLI surface
 
-## License
-
-MIT
